@@ -18,7 +18,7 @@ impl RabbitMQClient {
         url: &str,
         queue_name: &str,
         max_retries: usize,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let properties = ConnectionProperties::default()
             .with_connection_name("rabbitmq_client_connection".into())
             .with_experimental_recovery_config(RecoveryConfig::full())
@@ -55,10 +55,10 @@ impl RabbitMQClient {
         consumer_tag: &str,
         message_handler: F,
         cancellation_token: CancellationToken,
-    ) -> Result<(), Box<dyn std::error::Error>>
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
-        F: Fn(Vec<u8>) -> Fut,
-        Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+        F: Fn(Vec<u8>) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
     {
         let mut consumer = self
             .channel
@@ -112,10 +112,10 @@ impl RabbitMQClient {
         &self,
         delivery: Delivery,
         message_handler: &F,
-    ) -> Result<(), Box<dyn std::error::Error>>
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
-        F: Fn(Vec<u8>) -> Fut,
-        Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+        F: Fn(Vec<u8>) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
     {
         let payload = delivery.data.clone();
         log::info!("Received message of {} bytes", payload.len());
@@ -133,7 +133,7 @@ impl RabbitMQClient {
         &self,
         message: &T,
         routing_key: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let payload = serde_json::to_vec(message)?;
         let routing = routing_key.unwrap_or(&self.queue_name);
 
@@ -151,7 +151,7 @@ impl RabbitMQClient {
         Ok(())
     }
 
-    async fn ack_delivery(&self, delivery: Delivery) -> Result<(), Box<dyn std::error::Error>> {
+    async fn ack_delivery(&self, delivery: Delivery) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         delivery
             .ack(BasicAckOptions::default())
             .await
@@ -162,7 +162,7 @@ impl RabbitMQClient {
         Ok(())
     }
 
-    async fn nack_delivery(&self, delivery: Delivery) -> Result<(), Box<dyn std::error::Error>> {
+    async fn nack_delivery(&self, delivery: Delivery) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         delivery
             .nack(BasicNackOptions {
                 requeue: true,
@@ -179,7 +179,7 @@ impl RabbitMQClient {
     async fn handle_connection_error(
         &self,
         error: LapinError,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if error.is_amqp_soft_error() || error.is_amqp_hard_error() {
             log::warn!("Detected connection error, waiting for recovery...");
             self.channel.wait_for_recovery(error).await?;
