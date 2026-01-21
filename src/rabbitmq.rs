@@ -8,12 +8,20 @@ use serde::{Serialize};
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+/// An asynchronous RabbitMQ client for publishing and consuming messages.
+///
+/// This client wraps the `lapin` library to provide a simpler interface,
+/// handling connection recovery, channel management, and structured message processing.
 pub struct RabbitMQClient {
     channel: Channel,
     queue_name: String,
 }
 
 impl RabbitMQClient {
+    /// Connects to RabbitMQ and ensures the target queue is declared.
+    ///
+    /// The client is configured with automatic connection recovery and a custom
+    /// backoff strategy for retries.
     pub async fn new(
         url: &str,
         queue_name: &str,
@@ -50,6 +58,14 @@ impl RabbitMQClient {
         })
     }
 
+    /// Starts an asynchronous loop to consume messages from the queue.
+    ///
+    /// It takes a `message_handler` closure that processes the raw payload.
+    /// The loop respects the provided `cancellation_token` for graceful shutdowns.
+    ///
+    /// # Inner Workings
+    /// It uses `tokio::select!` to listen for both incoming messages and cancellation signals.
+    /// Connection errors are intercepted and handled via the recovery mechanism.
     pub async fn start_consuming<F, Fut>(
         &mut self,
         consumer_tag: &str,
@@ -108,6 +124,15 @@ impl RabbitMQClient {
         Ok(())
     }
 
+    /// Internal logic for handling a single message delivery.
+    ///
+    /// This method ensures that the message handler is called and, crucially,
+    /// manages the message lifecycle via Acknowledgment (ACK) or Negative Acknowledgment (NACK).
+    ///
+    /// # Reliability Logic
+    /// If the `message_handler` succeeds (returns `Ok`), we call `ack_delivery` to remove the message from the queue.
+    /// If it fails (returns `Err`), we call `nack_delivery`, which instructs RabbitMQ to requeue the message
+    /// so it can be processed again (by this or another instance), ensuring no data is lost.
     async fn process_delivery<F, Fut>(
         &self,
         delivery: Delivery,
@@ -129,6 +154,9 @@ impl RabbitMQClient {
         }
     }
 
+    /// Publishes a serializable message to the specified routing key or the default queue.
+    ///
+    /// The message is automatically serialized to JSON before being sent.
     pub async fn publish<T: Serialize>(
         &self,
         message: &T,
@@ -151,6 +179,7 @@ impl RabbitMQClient {
         Ok(())
     }
 
+    /// Sends a success acknowledgment to RabbitMQ.
     async fn ack_delivery(&self, delivery: Delivery) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         delivery
             .ack(BasicAckOptions::default())
@@ -162,6 +191,7 @@ impl RabbitMQClient {
         Ok(())
     }
 
+    /// Sends a failure negative-acknowledgment to RabbitMQ with the `requeue` flag set to true.
     async fn nack_delivery(&self, delivery: Delivery) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         delivery
             .nack(BasicNackOptions {
@@ -176,6 +206,7 @@ impl RabbitMQClient {
         Ok(())
     }
 
+    /// Handles soft and hard AMQP errors by waiting for the underlying connection/channel recovery.
     async fn handle_connection_error(
         &self,
         error: LapinError,

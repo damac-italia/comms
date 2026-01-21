@@ -1,6 +1,6 @@
 [package]
 name = "comms"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Antonio Masala <antonio@damac.it>"]
 description = "Library for RabbitMQ and Redis communication"
@@ -10,10 +10,11 @@ repository = "https://github.com/damac-italia/comms"
 [dependencies]
 redis = "0.32.7"
 lapin = { version = "3.7.2", features = ["unstable"] }
-serde = { version = "1.0.145", features = ["derive"] }
-serde_json = "1.0.145"
-tokio = { version = "1.48.0", features = ["full"] }
-tokio-util = "0.7.17"
-tokio-stream = "0.1.17"
-log = "0.4.28"
+serde = { version = "1.0.149", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = "0.7.18"
+tokio-stream = "0.1.18"
+log = "0.4.29"
 env_logger = "0.11.8"
+chrono = "0.4.43"
