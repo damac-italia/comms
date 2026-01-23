@@ -143,8 +143,9 @@ impl RabbitMQClient {
                 self.queue_name
             );
 
-            let mut stream_ended = false;
+            let mut stream_ended;
             loop {
+                stream_ended = false;
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         log::info!("Cancellation received, shutting down RabbitMQ consumer...");

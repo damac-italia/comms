@@ -38,7 +38,7 @@ impl RedisClient {
             log::error!("Failed to acquire connection to Redis: {}", e);
             e
         })?;
-        redis::cmd("SELECT").arg(database).query(&mut conn)?;
+        redis::cmd("SELECT").arg(database).query::<()>(&mut conn)?;
         Ok(conn)
     }
 
