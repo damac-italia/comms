@@ -15,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 pub struct RabbitMQClient {
     channel: Channel,
     queue_name: String,
+    url: String,
+    max_retries: usize,
 }
 
 impl RabbitMQClient {
@@ -27,6 +29,21 @@ impl RabbitMQClient {
         queue_name: &str,
         max_retries: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let channel = Self::connect_with_retry(url, queue_name, max_retries).await?;
+
+        Ok(Self {
+            channel,
+            queue_name: queue_name.to_string(),
+            url: url.to_string(),
+            max_retries,
+        })
+    }
+
+    async fn connect_internal(
+        url: &str,
+        queue_name: &str,
+        max_retries: usize,
+    ) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
         let properties = ConnectionProperties::default()
             .with_connection_name("rabbitmq_client_connection".into())
             .with_experimental_recovery_config(RecoveryConfig::full())
@@ -51,11 +68,38 @@ impl RabbitMQClient {
             )
             .await?;
         log::info!("Queue declared: {}", queue_name);
+        Ok(channel)
+    }
 
-        Ok(Self {
-            channel,
-            queue_name: queue_name.to_string(),
-        })
+    async fn connect_with_retry(
+        url: &str,
+        queue_name: &str,
+        max_retries: usize,
+    ) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
+        let mut attempt = 1;
+        loop {
+            match Self::connect_internal(url, queue_name, max_retries).await {
+                Ok(channel) => {
+                    if attempt > 1 {
+                        log::info!("RabbitMQ reconnected after {} attempts", attempt);
+                    }
+                    return Ok(channel);
+                }
+                Err(e) => {
+                    if attempt == 1 {
+                        log::warn!("RabbitMQ connection failed: {}. Retrying every 3 seconds...", e);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    async fn reconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        log::warn!("RabbitMQ connection lost, attempting to reconnect...");
+        self.channel = Self::connect_with_retry(&self.url, &self.queue_name, self.max_retries).await?;
+        Ok(())
     }
 
     /// Starts an asynchronous loop to consume messages from the queue.
@@ -76,52 +120,62 @@ impl RabbitMQClient {
         F: Fn(Vec<u8>) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
     {
-        let mut consumer = self
-            .channel
-            .basic_consume(
-                &self.queue_name,
-                consumer_tag,
-                BasicConsumeOptions::default(),
-                FieldTable::default(),
-            )
-            .await?;
-
-        log::info!(
-            "Started consuming messages from queue '{}'",
-            self.queue_name
-        );
-
         loop {
-            tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    log::info!("Cancellation received, shutting down RabbitMQ consumer...");
-                    break;
-                }
-                delivery_option = consumer.next() => {
-                    match delivery_option {
-                        Some(Ok(delivery)) => {
-                            if let Err(e) = self.process_delivery(delivery, &message_handler).await {
-                                log::error!("Error processing delivery: {}", e);
+            let mut consumer = match self
+                .channel
+                .basic_consume(
+                    &self.queue_name,
+                    consumer_tag,
+                    BasicConsumeOptions::default(),
+                    FieldTable::default(),
+                )
+                .await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::error!("Failed to create consumer: {}", e);
+                        self.reconnect().await?;
+                        continue;
+                    }
+                };
+
+            log::info!(
+                "Started consuming messages from queue '{}'",
+                self.queue_name
+            );
+
+            let mut stream_ended = false;
+            loop {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        log::info!("Cancellation received, shutting down RabbitMQ consumer...");
+                        return Ok(());
+                    }
+                    delivery_option = consumer.next() => {
+                        match delivery_option {
+                            Some(Ok(delivery)) => {
+                                if let Err(e) = self.process_delivery(delivery, &message_handler).await {
+                                    log::error!("Error processing delivery: {}", e);
+                                }
                             }
-                        }
-                        Some(Err(e)) => {
-                            log::error!("Error receiving message: {}", e);
-                            self.handle_connection_error(e).await?;
-                        }
-                        None => {
-                            log::warn!("Consumer stream ended unexpectedly");
-                            break;
+                            Some(Err(e)) => {
+                                log::error!("Error receiving message: {}", e);
+                                stream_ended = true;
+                                break;
+                            }
+                            None => {
+                                log::warn!("Consumer stream ended unexpectedly");
+                                stream_ended = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        log::info!(
-            "Stopped consuming messages from queue '{}'",
-            self.queue_name
-        );
-        Ok(())
+            if stream_ended {
+                self.reconnect().await?;
+            }
+        }
     }
 
     /// Internal logic for handling a single message delivery.
