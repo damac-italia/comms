@@ -19,6 +19,7 @@ impl Clone for RedisClient {
     }
 }
 
+#[allow(unused)]
 impl RedisClient {
     /// Establishes a new connection to Redis and selects the specified database.
     pub fn new(url: &str, database: u8) -> Result<Self, RedisError> {
@@ -155,6 +156,27 @@ impl RedisClient {
     pub fn delete(&mut self, key: &str) -> redis::RedisResult<()> {
         self.ensure_connection()?;
         self.connection.del(key)
+    }
+
+    /// Deletes multiple keys from Redis in a single operation.
+    ///
+    /// # Arguments
+    /// * `keys` - A slice of key names to delete.
+    pub fn delete_bulk(&mut self, keys: &[&str]) -> redis::RedisResult<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.ensure_connection()?;
+        self.connection.del(keys)
+    }
+
+    /// Retrieves all keys matching a pattern.
+    ///
+    /// # Arguments
+    /// * `pattern` - The glob-style pattern to match (e.g., "user:*").
+    pub fn keys(&mut self, pattern: &str) -> redis::RedisResult<Vec<String>> {
+        self.ensure_connection()?;
+        self.connection.keys(pattern)
     }
 
     /// Checks if a key exists in Redis.
