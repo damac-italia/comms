@@ -12,8 +12,6 @@ pub struct Config {
     pub redis_url: String,
     /// The name of the RabbitMQ queue to use by default.
     pub queue_name: String,
-    /// Maximum number of connection retry attempts for RabbitMQ.
-    pub max_retries: usize,
     /// The Redis database index (0-15).
     pub redis_database: u8,
 }
@@ -25,7 +23,6 @@ impl Config {
     /// - `RABBITMQ_URL` (default: amqp://guest:guest@localhost:5672)
     /// - `REDIS_URL` (default: redis://localhost:6379)
     /// - `QUEUE_NAME` (default: default_queue)
-    /// - `MAX_RETRIES` (default: 3)
     /// - `REDIS_DATABASE` (default: 0)
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Config {
@@ -35,10 +32,6 @@ impl Config {
                 .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
             queue_name: env::var("QUEUE_NAME")
                 .unwrap_or_else(|_| "default_queue".to_string()),
-            max_retries: env::var("MAX_RETRIES")
-                .unwrap_or_else(|_| "3".to_string())
-                .parse()
-                .unwrap_or(3),
             redis_database: env::var("REDIS_DATABASE")
                 .unwrap_or_else(|_| "0".to_string())
                 .parse()
@@ -51,14 +44,12 @@ impl Config {
         rabbitmq_url: String,
         redis_url: String,
         queue_name: String,
-        max_retries: usize,
         redis_database: u8,
     ) -> Self {
         Config {
             rabbitmq_url,
             redis_url,
             queue_name,
-            max_retries,
             redis_database,
         }
     }

@@ -7,10 +7,19 @@
 pub mod config;
 pub mod redis;
 pub mod rabbitmq;
+pub mod tests;
 
 pub use config::Config;
 pub use redis::RedisClient;
 pub use rabbitmq::RabbitMQClient;
+pub use comms_macros::subscribe_rabbit;
+pub use tests::run_self_tests;
+
+#[async_trait::async_trait]
+pub trait RabbitHandler: Send + Sync {
+    fn queue_name(&self) -> &str;
+    async fn handle(&self, data: Vec<u8>) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
 
 use std::sync::Once;
 static LOGGER_INIT: Once = Once::new();

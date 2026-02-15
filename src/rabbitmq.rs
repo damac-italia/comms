@@ -1,63 +1,49 @@
-use lapin::{
+use deadpool_lapin::{Config as PoolConfig, Pool, Runtime};
+use deadpool_lapin::lapin::{
     message::Delivery,
     options::*,
     types::FieldTable,
-    Channel, Connection, ConnectionProperties, Error as LapinError, RecoveryConfig,
+    BasicProperties,
 };
-use serde::{Serialize};
+use serde::Serialize;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
+use crate::RabbitHandler;
+use std::sync::Arc;
 
 /// An asynchronous RabbitMQ client for publishing and consuming messages.
 ///
-/// This client wraps the `lapin` library to provide a simpler interface,
-/// handling connection recovery, channel management, and structured message processing.
+/// This client uses `deadpool-lapin` for connection pooling and automatic recovery.
 pub struct RabbitMQClient {
-    channel: Channel,
+    pool: Pool,
     queue_name: String,
-    url: String,
-    max_retries: usize,
 }
 
 #[allow(unused)]
 impl RabbitMQClient {
-    /// Connects to RabbitMQ and ensures the target queue is declared.
-    ///
-    /// The client is configured with automatic connection recovery and a custom
-    /// backoff strategy for retries.
+    /// Creates a new RabbitMQ client with connection pooling.
     pub async fn new(
         url: &str,
-        queue_name: &str,
-        max_retries: usize,
+        queue_name: &str
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let channel = Self::connect_with_retry(url, queue_name, max_retries).await?;
-
-        Ok(Self {
-            channel,
+        let mut cfg = PoolConfig::default();
+        cfg.url = Some(url.to_string());
+        
+        let pool = cfg.create_pool(Some(Runtime::Tokio1))?;
+        
+        // Ensure default queue exists
+        let client = Self {
+            pool,
             queue_name: queue_name.to_string(),
-            url: url.to_string(),
-            max_retries,
-        })
+        };
+        client.ensure_queue(queue_name).await?;
+        
+        Ok(client)
     }
 
-    async fn connect_internal(
-        url: &str,
-        queue_name: &str,
-        max_retries: usize,
-    ) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
-        let properties = ConnectionProperties::default()
-            .with_connection_name("rabbitmq_client_connection".into())
-            .with_experimental_recovery_config(RecoveryConfig::full())
-            .configure_backoff(|backoff| {
-                backoff.with_max_times(max_retries);
-            });
-
-        let connection = Connection::connect(url, properties).await?;
-        log::info!("Connected to RabbitMQ at: {}", url);
-
+    async fn ensure_queue(&self, queue_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let connection = self.pool.get().await?;
         let channel = connection.create_channel().await?;
-        log::info!("RabbitMQ channel created");
-
         channel
             .queue_declare(
                 queue_name,
@@ -69,125 +55,187 @@ impl RabbitMQClient {
             )
             .await?;
         log::info!("Queue declared: {}", queue_name);
-        Ok(channel)
-    }
-
-    async fn connect_with_retry(
-        url: &str,
-        queue_name: &str,
-        max_retries: usize,
-    ) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
-        let mut attempt = 1;
-        loop {
-            match Self::connect_internal(url, queue_name, max_retries).await {
-                Ok(channel) => {
-                    if attempt > 1 {
-                        log::info!("RabbitMQ reconnected after {} attempts", attempt);
-                    }
-                    return Ok(channel);
-                }
-                Err(e) => {
-                    if attempt == 1 {
-                        log::warn!("RabbitMQ connection failed: {}. Retrying every 3 seconds...", e);
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                    attempt += 1;
-                }
-            }
-        }
-    }
-
-    async fn reconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        log::warn!("RabbitMQ connection lost, attempting to reconnect...");
-        self.channel = Self::connect_with_retry(&self.url, &self.queue_name, self.max_retries).await?;
         Ok(())
     }
 
-    /// Starts an asynchronous loop to consume messages from the queue.
-    ///
-    /// It takes a `message_handler` closure that processes the raw payload.
-    /// The loop respects the provided `cancellation_token` for graceful shutdowns.
-    ///
-    /// # Inner Workings
-    /// It uses `tokio::select!` to listen for both incoming messages and cancellation signals.
-    /// Connection errors are intercepted and handled via the recovery mechanism.
-    pub async fn start_consuming<F, Fut>(
-        &mut self,
-        consumer_tag: &str,
-        message_handler: F,
+    /// Registers and starts a handler.
+    pub async fn register_handler<H: RabbitHandler + 'static>(
+        &self,
+        handler: H,
         cancellation_token: CancellationToken,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync,
-        Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
-    {
-        loop {
-            let mut consumer = match self
-                .channel
-                .basic_consume(
-                    &self.queue_name,
-                    consumer_tag,
-                    BasicConsumeOptions::default(),
-                    FieldTable::default(),
-                )
-                .await {
-                    Ok(c) => c,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let handler = Arc::new(handler);
+        let queue = handler.queue_name().to_string();
+        self.ensure_queue(&queue).await?;
+
+        let client_pool = self.pool.clone();
+        
+        tokio::spawn(async move {
+            let consumer_tag = format!("consumer-{}", queue);
+            loop {
+                if cancellation_token.is_cancelled() {
+                    break;
+                }
+
+                let connection = match client_pool.get().await {
+                    Ok(conn) => conn,
                     Err(e) => {
-                        log::error!("Failed to create consumer: {}", e);
-                        self.reconnect().await?;
+                        log::error!("Pool error for {}: {}. Retry 3s", queue, e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                         continue;
                     }
                 };
 
-            log::info!(
-                "Started consuming messages from queue '{}'",
-                self.queue_name
-            );
-
-            let stream_ended ;
-            loop {
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        log::info!("Cancellation received, shutting down RabbitMQ consumer...");
-                        return Ok(());
+                let channel = match connection.create_channel().await {
+                    Ok(ch) => ch,
+                    Err(e) => {
+                        log::error!("Channel error for {}: {}. Retry 3s", queue, e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        continue;
                     }
-                    delivery_option = consumer.next() => {
-                        match delivery_option {
-                            Some(Ok(delivery)) => {
-                                if let Err(e) = self.process_delivery(delivery, &message_handler).await {
-                                    log::error!("Error processing delivery: {}", e);
+                };
+
+                let mut consumer = match channel
+                    .basic_consume(
+                        &queue,
+                        &consumer_tag,
+                        BasicConsumeOptions::default(),
+                        FieldTable::default(),
+                    )
+                    .await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            log::error!("Consume error for {}: {}. Retry 3s", queue, e);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                            continue;
+                        }
+                    };
+
+                log::info!("Started consumer for queue '{}'", queue);
+
+                loop {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => return,
+                        delivery_option = consumer.next() => {
+                            match delivery_option {
+                                Some(Ok(delivery)) => {
+                                    let h = handler.clone();
+                                    tokio::spawn(async move {
+                                        let payload = delivery.data.clone();
+                                        match h.handle(payload).await {
+                                            Ok(_) => { let _ = delivery.ack(BasicAckOptions::default()).await; }
+                                            Err(e) => {
+                                                log::error!("Handler error: {}", e);
+                                                let _ = delivery.nack(BasicNackOptions { requeue: true, ..Default::default() }).await;
+                                            }
+                                        }
+                                    });
                                 }
-                            }
-                            Some(Err(e)) => {
-                                log::error!("Error receiving message: {}", e);
-                                stream_ended = true;
-                                break;
-                            }
-                            None => {
-                                log::warn!("Consumer stream ended unexpectedly");
-                                stream_ended = true;
-                                break;
+                                Some(Err(e)) => { log::error!("Stream error: {}", e); break; }
+                                None => { log::warn!("Stream ended"); break; }
                             }
                         }
                     }
                 }
             }
+        });
 
-            if stream_ended {
-                self.reconnect().await?;
-            }
-        }
+        Ok(())
     }
 
-    /// Internal logic for handling a single message delivery.
-    ///
-    /// This method ensures that the message handler is called and, crucially,
-    /// manages the message lifecycle via Acknowledgment (ACK) or Negative Acknowledgment (NACK).
-    ///
-    /// # Reliability Logic
-    /// If the `message_handler` succeeds (returns `Ok`), we call `ack_delivery` to remove the message from the queue.
-    /// If it fails (returns `Err`), we call `nack_delivery`, which instructs RabbitMQ to requeue the message
-    /// so it can be processed again (by this or another instance), ensuring no data is lost.
+    /// Starts an asynchronous loop to consume messages from the queue.
+    pub async fn start_consuming<F, Fut>(
+        &self,
+        consumer_tag: &str,
+        message_handler: F,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'static,
+    {
+        let queue_name = self.queue_name.clone();
+        let pool = self.pool.clone();
+        let consumer_tag = consumer_tag.to_string();
+
+        tokio::spawn(async move {
+            loop {
+                if cancellation_token.is_cancelled() {
+                    break;
+                }
+
+                let connection = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        log::error!("Failed to get connection from pool: {}. Retrying in 3s...", e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        continue;
+                    }
+                };
+
+                let channel = match connection.create_channel().await {
+                    Ok(ch) => ch,
+                    Err(e) => {
+                        log::error!("Failed to create channel: {}. Retrying in 3s...", e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        continue;
+                    }
+                };
+
+                let mut consumer = match channel
+                    .basic_consume(
+                        &queue_name,
+                        &consumer_tag,
+                        BasicConsumeOptions::default(),
+                        FieldTable::default(),
+                    )
+                    .await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            log::error!("Failed to create consumer: {}. Retrying in 3s...", e);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                            continue;
+                        }
+                    };
+
+                log::info!("Started consuming messages from queue '{}'", queue_name);
+
+                loop {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            log::info!("Cancellation received, shutting down RabbitMQ consumer...");
+                            return;
+                        }
+                        delivery_option = consumer.next() => {
+                            match delivery_option {
+                                Some(Ok(delivery)) => {
+                                    let payload = delivery.data.clone();
+                                    match message_handler(payload).await {
+                                        Ok(_) => { let _ = delivery.ack(BasicAckOptions::default()).await; }
+                                        Err(e) => {
+                                            log::error!("Error processing delivery: {}", e);
+                                            let _ = delivery.nack(BasicNackOptions { requeue: true, ..Default::default() }).await;
+                                        }
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    log::error!("Error receiving message: {}. Reconnecting consumer...", e);
+                                    break;
+                                }
+                                None => {
+                                    log::warn!("Consumer stream ended unexpectedly. Reconnecting consumer...");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     async fn process_delivery<F, Fut>(
         &self,
         delivery: Delivery,
@@ -198,20 +246,20 @@ impl RabbitMQClient {
         Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
     {
         let payload = delivery.data.clone();
-        log::info!("Received message of {} bytes", payload.len());
-
         match message_handler(payload).await {
-            Ok(_) => self.ack_delivery(delivery).await,
+            Ok(_) => {
+                delivery.ack(BasicAckOptions::default()).await?;
+                Ok(())
+            }
             Err(e) => {
                 log::error!("Message handler failed: {}", e);
-                self.nack_delivery(delivery).await
+                delivery.nack(BasicNackOptions { requeue: true, ..Default::default() }).await?;
+                Ok(())
             }
         }
     }
 
-    /// Publishes a serializable message to the specified routing key or the default queue.
-    ///
-    /// The message is automatically serialized to JSON before being sent.
+    /// Publishes a serializable message.
     pub async fn publish<T: Serialize>(
         &self,
         message: &T,
@@ -220,57 +268,20 @@ impl RabbitMQClient {
         let payload = serde_json::to_vec(message)?;
         let routing = routing_key.unwrap_or(&self.queue_name);
 
-        self.channel
+        let connection = self.pool.get().await?;
+        let channel = connection.create_channel().await?;
+
+        channel
             .basic_publish(
                 "",
                 routing,
                 BasicPublishOptions::default(),
                 &payload,
-                lapin::BasicProperties::default(),
+                BasicProperties::default(),
             )
             .await?;
 
         log::info!("Published message to queue '{}'", routing);
-        Ok(())
-    }
-
-    /// Sends a success acknowledgment to RabbitMQ.
-    async fn ack_delivery(&self, delivery: Delivery) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        delivery
-            .ack(BasicAckOptions::default())
-            .await
-            .map_err(|e| {
-                log::error!("Failed to ack message: {}", e);
-                e
-            })?;
-        Ok(())
-    }
-
-    /// Sends a failure negative-acknowledgment to RabbitMQ with the `requeue` flag set to true.
-    async fn nack_delivery(&self, delivery: Delivery) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        delivery
-            .nack(BasicNackOptions {
-                requeue: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| {
-                log::error!("Failed to nack message: {}", e);
-                e
-            })?;
-        Ok(())
-    }
-
-    /// Handles soft and hard AMQP errors by waiting for the underlying connection/channel recovery.
-    async fn handle_connection_error(
-        &self,
-        error: LapinError,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if error.is_amqp_soft_error() || error.is_amqp_hard_error() {
-            log::warn!("Detected connection error, waiting for recovery...");
-            self.channel.wait_for_recovery(error).await?;
-            log::info!("Connection recovered successfully");
-        }
         Ok(())
     }
 }
