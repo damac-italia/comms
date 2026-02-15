@@ -37,7 +37,7 @@ pub fn subscribe_rabbit(args: TokenStream, input: TokenStream) -> TokenStream {
         #input_fn
 
         #[allow(non_camel_case_types)]
-        pub struct #fn_name;
+        pub struct #fn_name {}
 
         #[async_trait::async_trait]
         impl comms::RabbitHandler for #fn_name {

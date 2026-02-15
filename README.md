@@ -100,7 +100,7 @@ async fn main() {
     let token = CancellationToken::new();
 
     // Register the handler defined above
-    client.register_handler(handle_task, token.clone()).await.unwrap();
+    client.register_handler(handle_task {}, token.clone()).await.unwrap();
     
     // Or use the low-level consumer
     client.start_consuming("tag", |payload| async move {
