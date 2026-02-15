@@ -193,11 +193,7 @@ impl RedisClient {
     /// FOR TESTING ONLY: Forces the connection to be dropped.
     pub fn force_disconnect(&mut self) {
         log::info!("Forcing Redis disconnection for testing...");
-        // We don't actually need to replace it with a broken one, 
-        // we just need to make sure the next check_connection() returns false.
-        // Since we can't easily mock the connection state without changing the struct,
-        // we'll just re-initialize it with the correct URL to trigger a "reconnection"
-        // which simulates the recovery path.
+        // Re-initializing simulates a connection reset
         self.connection = Self::connect_with_retry(&self.url, self.database);
     }
 }

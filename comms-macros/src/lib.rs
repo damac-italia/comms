@@ -47,7 +47,10 @@ pub fn subscribe_rabbit(args: TokenStream, input: TokenStream) -> TokenStream {
 
             async fn handle(&self, data: Vec<u8>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let request: #req_type = serde_json::from_slice(&data)?;
-                #fn_name(request).await
+                match #fn_name(request).await {
+                    Ok(r) => Ok(r),
+                    Err(e) => Err(e.into()),
+                }
             }
         }
     };
