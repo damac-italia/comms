@@ -105,7 +105,16 @@ impl RabbitMQClient {
                     .await {
                         Ok(c) => c,
                         Err(e) => {
-                            log::error!("Consume error for {}: {}. Retry 3s", queue, e);
+                            log::error!("Consume error for {}: {}. Attempting to declare queue...", queue, e);
+                            if let Err(decl_err) = channel.queue_declare(
+                                &queue,
+                                QueueDeclareOptions { durable: true, ..Default::default() },
+                                FieldTable::default(),
+                            ).await {
+                                log::error!("Failed to declare queue {} after consume error: {}. Retry 3s", queue, decl_err);
+                            } else {
+                                log::info!("Successfully declared queue {} after consume error.", queue);
+                            }
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                             continue;
                         }
@@ -192,7 +201,16 @@ impl RabbitMQClient {
                     .await {
                         Ok(c) => c,
                         Err(e) => {
-                            log::error!("Failed to create consumer: {}. Retrying in 3s...", e);
+                            log::error!("Failed to create consumer for {}: {}. Attempting to declare queue...", queue_name, e);
+                            if let Err(decl_err) = channel.queue_declare(
+                                &queue_name,
+                                QueueDeclareOptions { durable: true, ..Default::default() },
+                                FieldTable::default(),
+                            ).await {
+                                log::error!("Failed to declare queue {} after consume error: {}. Retry 3s", queue_name, decl_err);
+                            } else {
+                                log::info!("Successfully declared queue {} after consume error.", queue_name);
+                            }
                             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                             continue;
                         }
