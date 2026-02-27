@@ -66,7 +66,9 @@ impl RabbitMQClient {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let handler = Arc::new(handler);
         let queue = handler.queue_name().to_string();
-        self.ensure_queue(&queue).await?;
+        if queue != self.queue_name {
+            self.ensure_queue(&queue).await?;
+        }
 
         let client_pool = self.pool.clone();
         
