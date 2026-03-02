@@ -15,9 +15,21 @@ pub use rabbitmq::RabbitMQClient;
 pub use comms_macros::subscribe_rabbit;
 pub use tests::run_self_tests;
 
+/// Purges all messages from a RabbitMQ queue. Use on startup to discard stale requeued messages.
+/// Returns the number of purged messages.
+pub async fn purge_queue(
+    url: &str,
+    queue: &str,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    rabbitmq::purge_queue_impl(url, queue).await
+}
+
 #[async_trait::async_trait]
 pub trait RabbitHandler: Send + Sync {
     fn queue_name(&self) -> &str;
+    fn purge_on_startup(&self) -> bool {
+        false
+    }
     async fn handle(&self, data: Vec<u8>) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 

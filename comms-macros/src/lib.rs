@@ -9,15 +9,20 @@ pub fn subscribe_rabbit(args: TokenStream, input: TokenStream) -> TokenStream {
     let fn_args = &input_fn.sig.inputs;
     
     let mut queue_name = String::new();
-    
+    let mut purge_on_startup = false;
+
     let parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
     let attr_args = parse_macro_input!(args with parser);
-    
+
     for arg in attr_args {
         if let Meta::NameValue(nv) = arg {
             if nv.path.is_ident("queue") {
                 if let Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. }) = nv.value {
                     queue_name = s.value();
+                }
+            } else if nv.path.is_ident("purge_on_startup") {
+                if let Expr::Lit(syn::ExprLit { lit: Lit::Bool(b), .. }) = nv.value {
+                    purge_on_startup = b.value();
                 }
             }
         }
@@ -33,6 +38,16 @@ pub fn subscribe_rabbit(args: TokenStream, input: TokenStream) -> TokenStream {
         _ => panic!("Expected a typed argument"),
     };
 
+    let purge_on_startup_impl = if purge_on_startup {
+        quote! {
+            fn purge_on_startup(&self) -> bool {
+                true
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         #input_fn
 
@@ -44,6 +59,8 @@ pub fn subscribe_rabbit(args: TokenStream, input: TokenStream) -> TokenStream {
             fn queue_name(&self) -> &str {
                 #queue_name
             }
+
+            #purge_on_startup_impl
 
             async fn handle(&self, data: Vec<u8>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let request: #req_type = serde_json::from_slice(&data)?;

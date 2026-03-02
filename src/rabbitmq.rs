@@ -4,6 +4,8 @@ use deadpool_lapin::lapin::{
     options::*,
     types::FieldTable,
     BasicProperties,
+    Connection,
+    ConnectionProperties,
 };
 use serde::Serialize;
 use tokio_stream::StreamExt;
@@ -11,12 +13,48 @@ use tokio_util::sync::CancellationToken;
 use crate::RabbitHandler;
 use std::sync::Arc;
 
+/// Purges all messages from a RabbitMQ queue.
+pub async fn purge_queue_impl(
+    url: &str,
+    queue: &str,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = Connection::connect(url, ConnectionProperties::default())
+        .await
+        .map_err(|e| format!("Failed to connect to RabbitMQ for purge at {}: {}", url, e))?;
+
+    let channel = conn
+        .create_channel()
+        .await
+        .map_err(|e| format!("Failed to create channel for purge: {}", e))?;
+
+    channel
+        .queue_declare(
+            queue,
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| format!("Failed to declare queue '{}' for purge: {}", queue, e))?;
+
+    let purged = channel
+        .queue_purge(queue, QueuePurgeOptions::default())
+        .await
+        .map_err(|e| format!("Failed to purge queue '{}': {}", queue, e))?;
+
+    log::info!("Purged {} stale message(s) from queue '{}'", purged, queue);
+    Ok(purged)
+}
+
 /// An asynchronous RabbitMQ client for publishing and consuming messages.
 ///
 /// This client uses `deadpool-lapin` for connection pooling and automatic recovery.
 pub struct RabbitMQClient {
     pool: Pool,
     queue_name: String,
+    url: String,
 }
 
 #[allow(unused)]
@@ -30,14 +68,14 @@ impl RabbitMQClient {
         cfg.url = Some(url.to_string());
         
         let pool = cfg.create_pool(Some(Runtime::Tokio1))?;
-        
-        // Ensure default queue exists
+
         let client = Self {
             pool,
             queue_name: queue_name.to_string(),
+            url: url.to_string(),
         };
         client.ensure_queue(queue_name).await?;
-        
+
         Ok(client)
     }
 
@@ -68,6 +106,10 @@ impl RabbitMQClient {
         let queue = handler.queue_name().to_string();
         if queue != self.queue_name {
             self.ensure_queue(&queue).await?;
+        }
+
+        if handler.purge_on_startup() {
+            purge_queue_impl(&self.url, &queue).await?;
         }
 
         let client_pool = self.pool.clone();
