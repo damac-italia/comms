@@ -4,8 +4,6 @@ use deadpool_lapin::lapin::{
     options::*,
     types::FieldTable,
     BasicProperties,
-    Connection,
-    ConnectionProperties,
 };
 use serde::Serialize;
 use tokio_stream::StreamExt;
@@ -18,8 +16,12 @@ pub async fn purge_queue_impl(
     url: &str,
     queue: &str,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    let conn = Connection::connect(url, ConnectionProperties::default())
-        .await
+    let mut cfg = PoolConfig::default();
+    cfg.url = Some(url.to_string());
+    let pool = cfg.create_pool(Some(Runtime::Tokio1))
+        .map_err(|e| format!("Failed to create pool for purge: {}", e))?;
+
+    let conn = pool.get().await
         .map_err(|e| format!("Failed to connect to RabbitMQ for purge at {}: {}", url, e))?;
 
     let channel = conn
