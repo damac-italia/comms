@@ -1,29 +1,51 @@
 use redis::{Client, Commands, Connection, ConnectionLike, RedisError};
 use serde::{Deserialize, Serialize};
 
-/// A high-level Redis client with automatic connection management and JSON serialization.
+const MAX_RETRY_ATTEMPTS: u32 = 10;
+const INITIAL_RETRY_DELAY_SECS: u64 = 3;
+const MAX_RETRY_DELAY_SECS: u64 = 30;
+
+/// Strips credentials from a URL for safe logging (e.g. `redis://user:pass@host` → `redis://***@host`).
+fn sanitize_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            return format!("{}://***@{}", &url[..scheme_end], &after_scheme[at_pos + 1..]);
+        }
+    }
+    url.to_string()
+}
+
+/// A synchronous Redis client with automatic connection management and JSON serialization.
 ///
 /// This client handles connecting to Redis, switching databases, and provides
 /// type-safe wrappers for common operations by automatically serializing/deserializing
 /// data to/from JSON.
+///
+/// # Blocking Operations
+///
+/// All operations on this client are **synchronous and will block the calling thread**.
+/// When using this client from an async context (e.g. inside a Tokio runtime), wrap
+/// calls in [`tokio::task::spawn_blocking`] to avoid blocking the async executor:
+///
+/// ```ignore
+/// let value = tokio::task::spawn_blocking(move || {
+///     redis_client.get::<MyStruct>("key")
+/// }).await??;
+/// ```
 pub struct RedisClient {
     url: String,
     database: u8,
     connection: Connection,
 }
 
-impl Clone for RedisClient {
-    /// Creates a new connection to the same Redis instance.
-    fn clone(&self) -> Self {
-        Self::new(&self.url, self.database).expect("Failed to clone Redis client")
-    }
-}
-
-#[allow(unused)]
 impl RedisClient {
     /// Establishes a new connection to Redis and selects the specified database.
+    ///
+    /// Retries up to 10 times with exponential backoff (3s → 6s → 12s, capped at 30s)
+    /// before returning an error.
     pub fn new(url: &str, database: u8) -> Result<Self, RedisError> {
-        let connection = Self::connect_with_retry(url, database);
+        let connection = Self::connect_with_retry(url, database)?;
         log::info!("Successfully connected to Redis on database {}", database);
         Ok(RedisClient {
             url: url.to_string(),
@@ -32,47 +54,60 @@ impl RedisClient {
         })
     }
 
+    /// Creates a new client connected to the same Redis instance and database.
+    ///
+    /// Unlike `Clone`, this method is fallible and will return an error if the
+    /// connection cannot be established.
+    pub fn try_clone(&self) -> Result<Self, RedisError> {
+        Self::new(&self.url, self.database)
+    }
+
     /// Internal helper to open a connection and select database.
     fn connect_and_select(url: &str, database: u8) -> Result<Connection, RedisError> {
         let client = Client::open(url)?;
         let mut conn = client.get_connection().map_err(|e| {
-            log::error!("Failed to acquire connection to Redis: {}", e);
+            log::error!("Failed to acquire connection to Redis at {}: {}", sanitize_url(url), e);
             e
         })?;
         redis::cmd("SELECT").arg(database).query::<()>(&mut conn)?;
         Ok(conn)
     }
 
-    /// Connects to Redis with retry logic.
-    fn connect_with_retry(url: &str, database: u8) -> Connection {
-        let mut attempt = 1;
+    /// Connects to Redis with bounded retry logic and exponential backoff.
+    ///
+    /// Retries up to `MAX_RETRY_ATTEMPTS` times with delays of 3s, 6s, 12s, ...
+    /// capped at `MAX_RETRY_DELAY_SECS`. Returns an error if all attempts fail.
+    fn connect_with_retry(url: &str, database: u8) -> Result<Connection, RedisError> {
+        let mut attempt = 1u32;
+        let mut delay = INITIAL_RETRY_DELAY_SECS;
         loop {
             match Self::connect_and_select(url, database) {
                 Ok(conn) => {
                     if attempt > 1 {
                         log::info!("Redis reconnected after {} attempts", attempt);
                     }
-                    return conn;
+                    return Ok(conn);
                 }
                 Err(e) => {
-                    if attempt == 1 {
-                        log::warn!("Redis connection failed: {}. Retrying every 3 seconds...", e);
+                    if attempt >= MAX_RETRY_ATTEMPTS {
+                        log::error!(
+                            "Redis connection to {} failed after {} attempts: {}",
+                            sanitize_url(url), attempt, e
+                        );
+                        return Err(e);
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    if attempt == 1 {
+                        log::warn!(
+                            "Redis connection to {} failed: {}. Retrying (max {} attempts)...",
+                            sanitize_url(url), e, MAX_RETRY_ATTEMPTS
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(delay));
+                    delay = (delay * 2).min(MAX_RETRY_DELAY_SECS);
                     attempt += 1;
                 }
             }
         }
-    }
-
-    /// Internal helper to open a connection.
-    /// Deprecated in favor of connect_and_select used inside connect_with_retry
-    fn connect(url: &str) -> Result<Connection, RedisError> {
-        let client = Client::open(url)?;
-        client.get_connection().map_err(|e| {
-            log::error!("Failed to acquire connection to Redis: {}", e);
-            e
-        })
     }
 
     /// Checks if the current connection is still alive and attempts to reconnect if not.
@@ -82,7 +117,7 @@ impl RedisClient {
     fn ensure_connection(&mut self) -> Result<(), RedisError> {
         if !self.connection.check_connection() {
             log::warn!("Redis connection lost, attempting to reconnect...");
-            self.connection = Self::connect_with_retry(&self.url, self.database);
+            self.connection = Self::connect_with_retry(&self.url, self.database)?;
             log::info!("Redis connection reestablished");
         }
         Ok(())
@@ -190,10 +225,11 @@ impl RedisClient {
         log::info!("Redis connection closed");
     }
 
-    /// FOR TESTING ONLY: Forces the connection to be dropped.
-    pub fn force_disconnect(&mut self) {
-        log::info!("Forcing Redis disconnection for testing...");
-        // Re-initializing simulates a connection reset
-        self.connection = Self::connect_with_retry(&self.url, self.database);
+    /// FOR TESTING ONLY: Forces a reconnection to Redis, simulating a connection reset.
+    pub fn force_reconnect(&mut self) {
+        log::info!("Forcing Redis reconnection for testing...");
+        if let Ok(conn) = Self::connect_with_retry(&self.url, self.database) {
+            self.connection = conn;
+        }
     }
 }

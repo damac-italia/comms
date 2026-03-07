@@ -25,8 +25,8 @@ async fn test_redis(config: &Config) -> Result<(), Box<dyn std::error::Error + S
     log::debug!("Set key '{}' to value '{}'", key, value);
 
     // Simulate connection loss
-    log::info!("Simulating Redis connection loss...");
-    redis.force_disconnect();
+    log::info!("Simulating Redis connection reset...");
+    redis.force_reconnect();
 
     let retrieved: Option<String> = redis.get(key)?;
     log::debug!("Retrieved value after reconnection: {:?}", retrieved);

@@ -1,6 +1,5 @@
 use deadpool_lapin::{Config as PoolConfig, Pool, Runtime};
 use deadpool_lapin::lapin::{
-    message::Delivery,
     options::*,
     types::FieldTable,
     BasicProperties,
@@ -11,7 +10,23 @@ use tokio_util::sync::CancellationToken;
 use crate::RabbitHandler;
 use std::sync::Arc;
 
-/// Purges all messages from a RabbitMQ queue.
+const DEFAULT_PREFETCH_COUNT: u16 = 10;
+
+/// Strips credentials from a URL for safe logging (e.g. `amqp://user:pass@host` → `amqp://***@host`).
+fn sanitize_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            return format!("{}://***@{}", &url[..scheme_end], &after_scheme[at_pos + 1..]);
+        }
+    }
+    url.to_string()
+}
+
+/// Purges all messages from a RabbitMQ queue using a standalone connection.
+///
+/// **Warning:** This discards ALL messages in the queue irreversibly.
+/// Only use this for queues where stale messages are acceptable to lose.
 pub async fn purge_queue_impl(
     url: &str,
     queue: &str,
@@ -21,8 +36,17 @@ pub async fn purge_queue_impl(
     let pool = cfg.create_pool(Some(Runtime::Tokio1))
         .map_err(|e| format!("Failed to create pool for purge: {}", e))?;
 
+    purge_queue_with_pool(&pool, url, queue).await
+}
+
+/// Purges all messages from a RabbitMQ queue using an existing connection pool.
+async fn purge_queue_with_pool(
+    pool: &Pool,
+    url: &str,
+    queue: &str,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
     let conn = pool.get().await
-        .map_err(|e| format!("Failed to connect to RabbitMQ for purge at {}: {}", url, e))?;
+        .map_err(|e| format!("Failed to connect to RabbitMQ for purge at {}: {}", sanitize_url(url), e))?;
 
     let channel = conn
         .create_channel()
@@ -59,7 +83,6 @@ pub struct RabbitMQClient {
     url: String,
 }
 
-#[allow(unused)]
 impl RabbitMQClient {
     /// Creates a new RabbitMQ client with connection pooling.
     pub async fn new(
@@ -111,7 +134,7 @@ impl RabbitMQClient {
         }
 
         if handler.purge_on_startup() {
-            purge_queue_impl(&self.url, &queue).await?;
+            purge_queue_with_pool(&self.pool, &self.url, &queue).await?;
         }
 
         let client_pool = self.pool.clone();
@@ -140,6 +163,12 @@ impl RabbitMQClient {
                         continue;
                     }
                 };
+
+                if let Err(e) = channel.basic_qos(DEFAULT_PREFETCH_COUNT, BasicQosOptions::default()).await {
+                    log::error!("Failed to set QoS for {}: {}. Retry 3s", queue, e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    continue;
+                }
 
                 let mut consumer = match channel
                     .basic_consume(
@@ -207,11 +236,12 @@ impl RabbitMQClient {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'static,
+        Fut: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'static,
     {
         let queue_name = self.queue_name.clone();
         let pool = self.pool.clone();
         let consumer_tag = consumer_tag.to_string();
+        let message_handler = Arc::new(message_handler);
 
         tokio::spawn(async move {
             loop {
@@ -236,6 +266,12 @@ impl RabbitMQClient {
                         continue;
                     }
                 };
+
+                if let Err(e) = channel.basic_qos(DEFAULT_PREFETCH_COUNT, BasicQosOptions::default()).await {
+                    log::error!("Failed to set QoS for {}: {}. Retrying in 3s...", queue_name, e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    continue;
+                }
 
                 let mut consumer = match channel
                     .basic_consume(
@@ -273,14 +309,17 @@ impl RabbitMQClient {
                         delivery_option = consumer.next() => {
                             match delivery_option {
                                 Some(Ok(delivery)) => {
-                                    let payload = delivery.data.clone();
-                                    match message_handler(payload).await {
-                                        Ok(_) => { let _ = delivery.ack(BasicAckOptions::default()).await; }
-                                        Err(e) => {
-                                            log::error!("Error processing delivery: {}", e);
-                                            let _ = delivery.nack(BasicNackOptions { requeue: true, ..Default::default() }).await;
+                                    let handler = message_handler.clone();
+                                    tokio::spawn(async move {
+                                        let payload = delivery.data.clone();
+                                        match handler(payload).await {
+                                            Ok(_) => { let _ = delivery.ack(BasicAckOptions::default()).await; }
+                                            Err(e) => {
+                                                log::error!("Error processing delivery: {}", e);
+                                                let _ = delivery.nack(BasicNackOptions { requeue: true, ..Default::default() }).await;
+                                            }
                                         }
-                                    }
+                                    });
                                 }
                                 Some(Err(e)) => {
                                     log::error!("Error receiving message: {}. Reconnecting consumer...", e);
@@ -300,30 +339,10 @@ impl RabbitMQClient {
         Ok(())
     }
 
-    async fn process_delivery<F, Fut>(
-        &self,
-        delivery: Delivery,
-        message_handler: &F,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync,
-        Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
-    {
-        let payload = delivery.data.clone();
-        match message_handler(payload).await {
-            Ok(_) => {
-                delivery.ack(BasicAckOptions::default()).await?;
-                Ok(())
-            }
-            Err(e) => {
-                log::error!("Message handler failed: {}", e);
-                delivery.nack(BasicNackOptions { requeue: true, ..Default::default() }).await?;
-                Ok(())
-            }
-        }
-    }
-
-    /// Publishes a serializable message.
+    /// Publishes a serializable message to a queue with persistent delivery.
+    ///
+    /// Messages are published with `delivery_mode: 2` (persistent) to survive
+    /// broker restarts, matching the durable queue declarations used by this client.
     pub async fn publish<T: Serialize>(
         &self,
         message: &T,
@@ -341,7 +360,7 @@ impl RabbitMQClient {
                 routing,
                 BasicPublishOptions::default(),
                 &payload,
-                BasicProperties::default(),
+                BasicProperties::default().with_delivery_mode(2),
             )
             .await?;
 

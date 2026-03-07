@@ -7,7 +7,7 @@
 pub mod config;
 pub mod redis;
 pub mod rabbitmq;
-pub mod tests;
+mod tests;
 
 pub use config::Config;
 pub use redis::RedisClient;
@@ -17,6 +17,9 @@ pub use tests::run_self_tests;
 
 /// Purges all messages from a RabbitMQ queue. Use on startup to discard stale requeued messages.
 /// Returns the number of purged messages.
+///
+/// **Warning:** This discards ALL messages in the queue irreversibly.
+/// Only use this for queues where stale messages are acceptable to lose.
 pub async fn purge_queue(
     url: &str,
     queue: &str,
@@ -27,6 +30,8 @@ pub async fn purge_queue(
 #[async_trait::async_trait]
 pub trait RabbitHandler: Send + Sync {
     fn queue_name(&self) -> &str;
+    /// Whether to discard all existing messages in the queue when the handler starts.
+    /// Defaults to `false`. **Warning:** enabling this causes irreversible message loss.
     fn purge_on_startup(&self) -> bool {
         false
     }
