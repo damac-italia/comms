@@ -233,3 +233,32 @@ impl RedisClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_url_strips_credentials() {
+        assert_eq!(
+            sanitize_url("redis://user:pass@host:6379"),
+            "redis://***@host:6379"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_no_credentials() {
+        assert_eq!(
+            sanitize_url("redis://localhost:6379"),
+            "redis://localhost:6379"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_with_database_path() {
+        assert_eq!(
+            sanitize_url("redis://user:pass@host:6379/0"),
+            "redis://***@host:6379/0"
+        );
+    }
+}

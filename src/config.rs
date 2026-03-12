@@ -92,3 +92,79 @@ impl Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_creates_config_without_tls() {
+        let cfg = Config::new(
+            "amqp://localhost".into(),
+            "redis://localhost".into(),
+            "my_queue".into(),
+            3,
+        );
+        assert_eq!(cfg.rabbitmq_url, "amqp://localhost");
+        assert_eq!(cfg.redis_url, "redis://localhost");
+        assert_eq!(cfg.queue_name, "my_queue");
+        assert_eq!(cfg.redis_database, 3);
+        assert!(cfg.rabbitmq_tls.is_none());
+    }
+
+    #[test]
+    fn new_with_tls_stores_tls_config() {
+        let tls = RabbitTlsConfig::insecure();
+        let cfg = Config::new_with_tls(
+            "amqps://host".into(),
+            "redis://host".into(),
+            "q".into(),
+            0,
+            tls,
+        );
+        let tls = cfg.rabbitmq_tls.unwrap();
+        assert!(tls.skip_cert_verification);
+        assert!(tls.ca_cert_path.is_none());
+    }
+
+    #[test]
+    fn from_env_defaults_and_tls_override() {
+        // SAFETY: test-only; env var mutations are not thread-safe but
+        // this single test exercises both code paths sequentially.
+        unsafe {
+            std::env::remove_var("RABBITMQ_URL");
+            std::env::remove_var("REDIS_URL");
+            std::env::remove_var("QUEUE_NAME");
+            std::env::remove_var("REDIS_DATABASE");
+            std::env::remove_var("RABBITMQ_TLS_CA_CERT");
+            std::env::remove_var("RABBITMQ_TLS_SKIP_VERIFY");
+        }
+
+        // Without TLS vars → defaults, no TLS
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.rabbitmq_url, "amqp://guest:guest@localhost:5672");
+        assert_eq!(cfg.redis_url, "redis://localhost:6379");
+        assert_eq!(cfg.queue_name, "default_queue");
+        assert_eq!(cfg.redis_database, 0);
+        assert!(cfg.rabbitmq_tls.is_none());
+
+        // With TLS skip-verify → TLS config present
+        unsafe {
+            std::env::set_var("RABBITMQ_TLS_SKIP_VERIFY", "true");
+        }
+        let cfg = Config::from_env().unwrap();
+        let tls = cfg.rabbitmq_tls.expect("TLS config should be present");
+        assert!(tls.skip_cert_verification);
+        assert!(tls.ca_cert_path.is_none());
+
+        unsafe { std::env::remove_var("RABBITMQ_TLS_SKIP_VERIFY"); }
+    }
+
+    #[test]
+    fn config_is_cloneable() {
+        let cfg = Config::new("a".into(), "b".into(), "c".into(), 1);
+        let cloned = cfg.clone();
+        assert_eq!(cloned.rabbitmq_url, cfg.rabbitmq_url);
+        assert_eq!(cloned.redis_database, cfg.redis_database);
+    }
+}

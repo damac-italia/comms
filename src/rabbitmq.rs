@@ -5,7 +5,7 @@ use deadpool_lapin::lapin::{
     Connection,
     ConnectionProperties,
     ConnectionState,
-    tcp::{AMQPUriTcpExt, NativeTlsConnector},
+    tcp::{NativeTlsConnector, TcpStream},
     uri::AMQPUri,
 };
 use deadpool::managed::{self, Metrics, RecycleError, RecycleResult};
@@ -122,23 +122,26 @@ impl managed::Manager for TlsAwareManager {
         let skip = self.skip_verify;
 
         let connect = move |uri: &AMQPUri| {
-            uri.connect().and_then(|stream| {
-                let mut builder = NativeTlsConnector::builder();
+            // Raw TCP connect — no automatic TLS so we control the handshake.
+            let stream = TcpStream::connect((uri.authority.host.as_str(), uri.authority.port))?;
 
-                if skip {
-                    builder.danger_accept_invalid_certs(true);
-                    builder.danger_accept_invalid_hostnames(true);
-                }
+            let mut builder = NativeTlsConnector::builder();
 
-                if let Some(ref pem) = ca_pem {
-                    let cert = native_tls::Certificate::from_pem(pem.as_bytes())
-                        .map_err(std::io::Error::other)?;
-                    builder.add_root_certificate(cert);
-                }
+            if skip {
+                builder.danger_accept_invalid_certs(true);
+                builder.danger_accept_invalid_hostnames(true);
+            }
 
-                let connector = builder.build().map_err(std::io::Error::other)?;
-                stream.into_native_tls(&connector, &uri.authority.host)
-            })
+            if let Some(ref pem) = ca_pem {
+                let cert = native_tls::Certificate::from_pem(pem.as_bytes())
+                    .map_err(std::io::Error::other)?;
+                builder.add_root_certificate(cert);
+            }
+
+            let connector = builder.build().map_err(std::io::Error::other)?;
+            let stream = stream.into_native_tls(&connector, &uri.authority.host)?;
+            stream.set_nonblocking(true)?;
+            Ok(stream)
         };
 
         Connection::connector(
@@ -759,5 +762,382 @@ impl<'a> MessageBuilder<'a> {
         self.client
             .publish_raw(&self.payload, routing, &self.exchange, self.properties, self.options)
             .await
+    }
+
+    #[cfg(test)]
+    fn routing_key(&self) -> Option<&str> {
+        self.routing_key.as_deref()
+    }
+
+    #[cfg(test)]
+    fn exchange_name(&self) -> &str {
+        &self.exchange
+    }
+
+    #[cfg(test)]
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    #[cfg(test)]
+    fn properties(&self) -> &BasicProperties {
+        &self.properties
+    }
+
+    #[cfg(test)]
+    fn options(&self) -> &BasicPublishOptions {
+        &self.options
+    }
+}
+
+#[cfg(test)]
+impl RabbitMQClient {
+    /// Creates a lightweight client for unit tests. The pool is valid but
+    /// never contacted — tests must not call methods that hit the broker.
+    fn test_instance(queue_name: &str) -> Self {
+        let mgr = TlsAwareManager::new("amqp://guest:guest@localhost/%2f", None)
+            .expect("test URI should parse");
+        let pool = Pool::builder(mgr).max_size(1).build()
+            .expect("pool build should succeed");
+        Self {
+            pool,
+            queue_name: queue_name.to_string(),
+            url: "amqp://localhost".to_string(),
+            tls_config: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct Order {
+        id: u32,
+        item: String,
+    }
+
+    fn client() -> RabbitMQClient {
+        RabbitMQClient::test_instance("default_queue")
+    }
+
+    // ── Builder defaults ────────────────────────────────────────────
+
+    #[test]
+    fn builder_defaults_are_persistent_with_empty_exchange() {
+        let c = client();
+        let b = c.send_bytes(b"hello".to_vec());
+
+        assert_eq!(b.payload(), b"hello");
+        assert_eq!(b.routing_key(), None);
+        assert_eq!(b.exchange_name(), "");
+        assert_eq!(b.properties().delivery_mode(), &Some(2));
+        assert!(!b.options().mandatory);
+        assert!(!b.options().immediate);
+    }
+
+    // ── Serialization via send() ────────────────────────────────────
+
+    #[test]
+    fn send_serializes_message_to_json() {
+        let c = client();
+        let order = Order { id: 42, item: "widget".into() };
+        let b = c.send(&order);
+
+        let parsed: serde_json::Value = serde_json::from_slice(b.payload()).unwrap();
+        assert_eq!(parsed["id"], 42);
+        assert_eq!(parsed["item"], "widget");
+    }
+
+    // ── Routing / exchange ──────────────────────────────────────────
+
+    #[test]
+    fn to_sets_routing_key() {
+        let c = client();
+        let b = c.send_bytes(vec![]).to("orders.priority");
+        assert_eq!(b.routing_key(), Some("orders.priority"));
+    }
+
+    #[test]
+    fn exchange_sets_exchange() {
+        let c = client();
+        let b = c.send_bytes(vec![]).exchange("my_exchange");
+        assert_eq!(b.exchange_name(), "my_exchange");
+    }
+
+    // ── Property setters ────────────────────────────────────────────
+
+    #[test]
+    fn content_type_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).content_type("application/json");
+        assert_eq!(
+            b.properties().content_type().as_ref().map(|s| s.as_str()),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn content_encoding_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).content_encoding("gzip");
+        assert_eq!(
+            b.properties().content_encoding().as_ref().map(|s| s.as_str()),
+            Some("gzip")
+        );
+    }
+
+    #[test]
+    fn transient_sets_delivery_mode_1() {
+        let c = client();
+        let b = c.send_bytes(vec![]).transient();
+        assert_eq!(b.properties().delivery_mode(), &Some(1));
+    }
+
+    #[test]
+    fn persistent_sets_delivery_mode_2() {
+        let c = client();
+        let b = c.send_bytes(vec![]).transient().persistent();
+        assert_eq!(b.properties().delivery_mode(), &Some(2));
+    }
+
+    #[test]
+    fn priority_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).priority(9);
+        assert_eq!(b.properties().priority(), &Some(9));
+    }
+
+    #[test]
+    fn correlation_id_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).correlation_id("req-123");
+        assert_eq!(
+            b.properties().correlation_id().as_ref().map(|s| s.as_str()),
+            Some("req-123")
+        );
+    }
+
+    #[test]
+    fn reply_to_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).reply_to("reply_queue");
+        assert_eq!(
+            b.properties().reply_to().as_ref().map(|s| s.as_str()),
+            Some("reply_queue")
+        );
+    }
+
+    #[test]
+    fn expiration_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).expiration("30000");
+        assert_eq!(
+            b.properties().expiration().as_ref().map(|s| s.as_str()),
+            Some("30000")
+        );
+    }
+
+    #[test]
+    fn expires_in_secs_converts_to_millis() {
+        let c = client();
+        let b = c.send_bytes(vec![]).expires_in_secs(60);
+        assert_eq!(
+            b.properties().expiration().as_ref().map(|s| s.as_str()),
+            Some("60000")
+        );
+    }
+
+    #[test]
+    fn message_id_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).message_id("msg-456");
+        assert_eq!(
+            b.properties().message_id().as_ref().map(|s| s.as_str()),
+            Some("msg-456")
+        );
+    }
+
+    #[test]
+    fn timestamp_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).timestamp(1_700_000_000);
+        assert_eq!(b.properties().timestamp(), &Some(1_700_000_000));
+    }
+
+    #[test]
+    fn message_type_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).message_type("order.created");
+        assert_eq!(
+            b.properties().kind().as_ref().map(|s| s.as_str()),
+            Some("order.created")
+        );
+    }
+
+    #[test]
+    fn app_id_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).app_id("my-service");
+        assert_eq!(
+            b.properties().app_id().as_ref().map(|s| s.as_str()),
+            Some("my-service")
+        );
+    }
+
+    #[test]
+    fn headers_are_set() {
+        let c = client();
+        let mut headers = FieldTable::default();
+        headers.insert("x-retry".into(), deadpool_lapin::lapin::types::AMQPValue::LongInt(3));
+        let b = c.send_bytes(vec![]).headers(headers);
+        assert!(b.properties().headers().is_some());
+    }
+
+    // ── Publish options ─────────────────────────────────────────────
+
+    #[test]
+    fn mandatory_flag_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).mandatory();
+        assert!(b.options().mandatory);
+    }
+
+    #[test]
+    fn immediate_flag_is_set() {
+        let c = client();
+        let b = c.send_bytes(vec![]).immediate();
+        assert!(b.options().immediate);
+    }
+
+    // ── Chaining ────────────────────────────────────────────────────
+
+    #[test]
+    fn full_chain_builds_correctly() {
+        let c = client();
+        let order = Order { id: 1, item: "gadget".into() };
+        let b = c.send(&order)
+            .to("orders.priority")
+            .exchange("orders_exchange")
+            .priority(9)
+            .expires_in_secs(30)
+            .message_id("ord-001")
+            .correlation_id("corr-99")
+            .reply_to("responses")
+            .content_type("application/json")
+            .app_id("order-service")
+            .mandatory();
+
+        assert_eq!(b.routing_key(), Some("orders.priority"));
+        assert_eq!(b.exchange_name(), "orders_exchange");
+        assert_eq!(b.properties().priority(), &Some(9));
+        assert_eq!(
+            b.properties().expiration().as_ref().map(|s| s.as_str()),
+            Some("30000")
+        );
+        assert_eq!(
+            b.properties().message_id().as_ref().map(|s| s.as_str()),
+            Some("ord-001")
+        );
+        assert!(b.options().mandatory);
+        assert!(!b.options().immediate);
+    }
+
+    #[test]
+    fn send_bytes_preserves_raw_payload() {
+        let c = client();
+        let raw = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let b = c.send_bytes(raw.clone()).to("binary_queue").transient();
+
+        assert_eq!(b.payload(), &raw);
+        assert_eq!(b.properties().delivery_mode(), &Some(1));
+    }
+
+    // ── RabbitTlsConfig ─────────────────────────────────────────────
+
+    #[test]
+    fn tls_config_with_ca_cert() {
+        let cfg = RabbitTlsConfig::with_ca_cert("/path/to/ca.pem");
+        assert_eq!(cfg.ca_cert_path.as_deref(), Some("/path/to/ca.pem"));
+        assert!(!cfg.skip_cert_verification);
+    }
+
+    #[test]
+    fn tls_config_insecure() {
+        let cfg = RabbitTlsConfig::insecure();
+        assert!(cfg.ca_cert_path.is_none());
+        assert!(cfg.skip_cert_verification);
+    }
+
+    #[test]
+    fn tls_config_with_ca_cert_accepts_string() {
+        let path = String::from("/etc/ssl/certs/ca.pem");
+        let cfg = RabbitTlsConfig::with_ca_cert(path);
+        assert_eq!(cfg.ca_cert_path.as_deref(), Some("/etc/ssl/certs/ca.pem"));
+    }
+
+    #[test]
+    fn tls_config_is_cloneable() {
+        let cfg = RabbitTlsConfig::with_ca_cert("/ca.pem");
+        let cloned = cfg.clone();
+        assert_eq!(cloned.ca_cert_path, cfg.ca_cert_path);
+        assert_eq!(cloned.skip_cert_verification, cfg.skip_cert_verification);
+    }
+
+    // ── TlsAwareManager construction ────────────────────────────────
+
+    #[test]
+    fn manager_new_plain_connection() {
+        let mgr = TlsAwareManager::new("amqp://guest:guest@localhost:5672/%2f", None);
+        assert!(mgr.is_ok());
+        let mgr = mgr.unwrap();
+        assert!(!mgr.use_tls);
+        assert!(!mgr.skip_verify);
+        assert!(mgr.ca_cert_pem.is_none());
+    }
+
+    #[test]
+    fn manager_new_with_insecure_tls() {
+        let tls = RabbitTlsConfig::insecure();
+        let mgr = TlsAwareManager::new("amqps://user:pass@host:5671/%2f", Some(&tls));
+        assert!(mgr.is_ok());
+        let mgr = mgr.unwrap();
+        assert!(mgr.use_tls);
+        assert!(mgr.skip_verify);
+        assert!(mgr.ca_cert_pem.is_none());
+    }
+
+    #[test]
+    fn manager_new_rejects_invalid_uri() {
+        let result = TlsAwareManager::new("not-a-valid-uri", None);
+        assert!(result.is_err());
+    }
+
+    // ── sanitize_url ────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_url_strips_credentials() {
+        assert_eq!(
+            sanitize_url("amqp://user:pass@host:5672"),
+            "amqp://***@host:5672"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_no_credentials() {
+        assert_eq!(
+            sanitize_url("amqp://localhost:5672"),
+            "amqp://localhost:5672"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_preserves_vhost() {
+        assert_eq!(
+            sanitize_url("amqp://user:pass@host:5672/%2f"),
+            "amqp://***@host:5672/%2f"
+        );
     }
 }
