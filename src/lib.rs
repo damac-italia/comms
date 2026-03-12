@@ -11,7 +11,7 @@ mod tests;
 
 pub use config::Config;
 pub use redis::RedisClient;
-pub use rabbitmq::RabbitMQClient;
+pub use rabbitmq::{RabbitMQClient, RabbitTlsConfig};
 pub use comms_macros::subscribe_rabbit;
 pub use tests::run_self_tests;
 
@@ -24,7 +24,20 @@ pub async fn purge_queue(
     url: &str,
     queue: &str,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    rabbitmq::purge_queue_impl(url, queue).await
+    rabbitmq::purge_queue_impl(url, queue, None).await
+}
+
+/// Purges all messages from a RabbitMQ queue over a TLS connection.
+/// Returns the number of purged messages.
+///
+/// **Warning:** This discards ALL messages in the queue irreversibly.
+/// Only use this for queues where stale messages are acceptable to lose.
+pub async fn purge_queue_tls(
+    url: &str,
+    queue: &str,
+    tls_config: &RabbitTlsConfig,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    rabbitmq::purge_queue_impl(url, queue, Some(tls_config)).await
 }
 
 #[async_trait::async_trait]

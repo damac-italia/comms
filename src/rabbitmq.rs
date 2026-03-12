@@ -1,9 +1,14 @@
-use deadpool_lapin::{Config as PoolConfig, Pool, Runtime};
 use deadpool_lapin::lapin::{
     options::*,
     types::FieldTable,
     BasicProperties,
+    Connection,
+    ConnectionProperties,
+    ConnectionState,
+    tcp::{AMQPUriTcpExt, NativeTlsConnector},
+    uri::AMQPUri,
 };
+use deadpool::managed::{self, Metrics, RecycleError, RecycleResult};
 use serde::Serialize;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -11,6 +16,145 @@ use crate::RabbitHandler;
 use std::sync::Arc;
 
 const DEFAULT_PREFETCH_COUNT: u16 = 10;
+
+/// TLS configuration for RabbitMQ connections.
+///
+/// Use this to connect to RabbitMQ over `amqps://` with custom CA certificates
+/// or to skip certificate verification for development environments.
+#[derive(Clone, Debug)]
+pub struct RabbitTlsConfig {
+    /// Path to a PEM-encoded CA certificate file to trust.
+    /// When set, this certificate is added to the TLS root store.
+    pub ca_cert_path: Option<String>,
+    /// Skip TLS certificate verification entirely.
+    /// **Warning:** This is insecure and should only be used in development/testing.
+    pub skip_cert_verification: bool,
+}
+
+impl RabbitTlsConfig {
+    /// Creates a TLS config that trusts a specific CA certificate.
+    pub fn with_ca_cert(path: impl Into<String>) -> Self {
+        Self {
+            ca_cert_path: Some(path.into()),
+            skip_cert_verification: false,
+        }
+    }
+
+    /// Creates a TLS config that skips all certificate verification.
+    /// **Warning:** This is insecure and should only be used in development/testing.
+    pub fn insecure() -> Self {
+        Self {
+            ca_cert_path: None,
+            skip_cert_verification: true,
+        }
+    }
+}
+
+/// A pool manager that supports both plain and TLS RabbitMQ connections.
+struct TlsAwareManager {
+    addr: String,
+    parsed_uri: AMQPUri,
+    ca_cert_pem: Option<String>,
+    skip_verify: bool,
+    use_tls: bool,
+}
+
+impl std::fmt::Debug for TlsAwareManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsAwareManager")
+            .field("addr", &sanitize_url(&self.addr))
+            .field("use_tls", &self.use_tls)
+            .field("skip_verify", &self.skip_verify)
+            .field("has_ca_cert", &self.ca_cert_pem.is_some())
+            .finish()
+    }
+}
+
+impl TlsAwareManager {
+    fn new(
+        addr: &str,
+        tls_config: Option<&RabbitTlsConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed_uri: AMQPUri = addr.parse()
+            .map_err(|e: String| format!("Failed to parse AMQP URI: {}", e))?;
+
+        let (ca_cert_pem, skip_verify, use_tls) = match tls_config {
+            Some(tls) => {
+                let pem = match &tls.ca_cert_path {
+                    Some(path) => {
+                        let content = std::fs::read_to_string(path)
+                            .map_err(|e| format!("Failed to read CA certificate at '{}': {}", path, e))?;
+                        Some(content)
+                    }
+                    None => None,
+                };
+                (pem, tls.skip_cert_verification, true)
+            }
+            None => (None, false, false),
+        };
+
+        Ok(Self {
+            addr: addr.to_string(),
+            parsed_uri,
+            ca_cert_pem,
+            skip_verify,
+            use_tls,
+        })
+    }
+}
+
+impl managed::Manager for TlsAwareManager {
+    type Type = Connection;
+    type Error = deadpool_lapin::lapin::Error;
+
+    async fn create(&self) -> Result<Connection, Self::Error> {
+        if !self.use_tls {
+            return Connection::connect(&self.addr, ConnectionProperties::default()).await;
+        }
+
+        let ca_pem = self.ca_cert_pem.clone();
+        let skip = self.skip_verify;
+
+        let connect = move |uri: &AMQPUri| {
+            uri.connect().and_then(|stream| {
+                let mut builder = NativeTlsConnector::builder();
+
+                if skip {
+                    builder.danger_accept_invalid_certs(true);
+                    builder.danger_accept_invalid_hostnames(true);
+                }
+
+                if let Some(ref pem) = ca_pem {
+                    let cert = native_tls::Certificate::from_pem(pem.as_bytes())
+                        .map_err(std::io::Error::other)?;
+                    builder.add_root_certificate(cert);
+                }
+
+                let connector = builder.build().map_err(std::io::Error::other)?;
+                stream.into_native_tls(&connector, &uri.authority.host)
+            })
+        };
+
+        Connection::connector(
+            self.parsed_uri.clone(),
+            Box::new(connect),
+            ConnectionProperties::default(),
+        )
+        .await
+    }
+
+    async fn recycle(&self, conn: &mut Connection, _: &Metrics) -> RecycleResult<Self::Error> {
+        match conn.status().state() {
+            ConnectionState::Connected => Ok(()),
+            state => Err(RecycleError::message(format!(
+                "lapin connection is in state: {:?}",
+                state
+            ))),
+        }
+    }
+}
+
+type Pool = managed::Pool<TlsAwareManager>;
 
 /// Strips credentials from a URL for safe logging (e.g. `amqp://user:pass@host` → `amqp://***@host`).
 fn sanitize_url(url: &str) -> String {
@@ -30,10 +174,10 @@ fn sanitize_url(url: &str) -> String {
 pub async fn purge_queue_impl(
     url: &str,
     queue: &str,
+    tls_config: Option<&RabbitTlsConfig>,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    let mut cfg = PoolConfig::default();
-    cfg.url = Some(url.to_string());
-    let pool = cfg.create_pool(Some(Runtime::Tokio1))
+    let manager = TlsAwareManager::new(url, tls_config)?;
+    let pool = Pool::builder(manager).build()
         .map_err(|e| format!("Failed to create pool for purge: {}", e))?;
 
     purge_queue_with_pool(&pool, url, queue).await
@@ -76,28 +220,66 @@ async fn purge_queue_with_pool(
 
 /// An asynchronous RabbitMQ client for publishing and consuming messages.
 ///
-/// This client uses `deadpool-lapin` for connection pooling and automatic recovery.
+/// This client uses connection pooling and automatic recovery. Supports both
+/// plain AMQP and TLS-secured (`amqps://`) connections.
 pub struct RabbitMQClient {
     pool: Pool,
     queue_name: String,
     url: String,
+    #[allow(dead_code)]
+    tls_config: Option<RabbitTlsConfig>,
 }
 
 impl RabbitMQClient {
-    /// Creates a new RabbitMQ client with connection pooling.
+    /// Creates a new RabbitMQ client with connection pooling (no TLS).
     pub async fn new(
         url: &str,
         queue_name: &str
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let mut cfg = PoolConfig::default();
-        cfg.url = Some(url.to_string());
-        
-        let pool = cfg.create_pool(Some(Runtime::Tokio1))?;
+        Self::create(url, queue_name, None).await
+    }
+
+    /// Creates a new RabbitMQ client with TLS support.
+    ///
+    /// Use `amqps://` in your URL when connecting with TLS.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use comms::rabbitmq::{RabbitMQClient, RabbitTlsConfig};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// // With a CA certificate
+    /// let tls = RabbitTlsConfig::with_ca_cert("/path/to/ca.pem");
+    /// let client = RabbitMQClient::new_with_tls("amqps://user:pass@host:5671", "queue", tls).await?;
+    ///
+    /// // Skip verification (dev only)
+    /// let tls = RabbitTlsConfig::insecure();
+    /// let client = RabbitMQClient::new_with_tls("amqps://user:pass@host:5671", "queue", tls).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn new_with_tls(
+        url: &str,
+        queue_name: &str,
+        tls_config: RabbitTlsConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::create(url, queue_name, Some(tls_config)).await
+    }
+
+    async fn create(
+        url: &str,
+        queue_name: &str,
+        tls_config: Option<RabbitTlsConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let manager = TlsAwareManager::new(url, tls_config.as_ref())?;
+        let pool = Pool::builder(manager).build()
+            .map_err(|e| format!("Failed to create connection pool: {}", e))?;
 
         let client = Self {
             pool,
             queue_name: queue_name.to_string(),
             url: url.to_string(),
+            tls_config,
         };
         client.ensure_queue(queue_name).await?;
 

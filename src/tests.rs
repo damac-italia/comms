@@ -39,7 +39,10 @@ async fn test_redis(config: &Config) -> Result<(), Box<dyn std::error::Error + S
 }
 
 async fn test_rabbitmq(config: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = RabbitMQClient::new(&config.rabbitmq_url, "comms_test_queue").await?;
+    let client = match &config.rabbitmq_tls {
+        Some(tls) => RabbitMQClient::new_with_tls(&config.rabbitmq_url, "comms_test_queue", tls.clone()).await?,
+        None => RabbitMQClient::new(&config.rabbitmq_url, "comms_test_queue").await?,
+    };
     let test_msg = TestMessage { id: 1, content: "test".to_string() };
     let ct = CancellationToken::new();
 
