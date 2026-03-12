@@ -11,7 +11,7 @@ mod tests;
 
 pub use config::Config;
 pub use redis::RedisClient;
-pub use rabbitmq::{RabbitMQClient, RabbitTlsConfig};
+pub use rabbitmq::{RabbitMQClient, RabbitTlsConfig, MessageBuilder};
 pub use comms_macros::subscribe_rabbit;
 pub use tests::run_self_tests;
 

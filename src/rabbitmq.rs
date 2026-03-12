@@ -17,6 +17,12 @@ use std::sync::Arc;
 
 const DEFAULT_PREFETCH_COUNT: u16 = 10;
 
+fn tokio_conn_properties() -> ConnectionProperties {
+    ConnectionProperties::default()
+        .with_executor(tokio_executor_trait::Tokio::current())
+        .with_reactor(tokio_reactor_trait::Tokio::current())
+}
+
 /// TLS configuration for RabbitMQ connections.
 ///
 /// Use this to connect to RabbitMQ over `amqps://` with custom CA certificates
@@ -109,7 +115,7 @@ impl managed::Manager for TlsAwareManager {
 
     async fn create(&self) -> Result<Connection, Self::Error> {
         if !self.use_tls {
-            return Connection::connect(&self.addr, ConnectionProperties::default()).await;
+            return Connection::connect(&self.addr, tokio_conn_properties()).await;
         }
 
         let ca_pem = self.ca_cert_pem.clone();
@@ -138,7 +144,7 @@ impl managed::Manager for TlsAwareManager {
         Connection::connector(
             self.parsed_uri.clone(),
             Box::new(connect),
-            ConnectionProperties::default(),
+            tokio_conn_properties(),
         )
         .await
     }
@@ -548,5 +554,210 @@ impl RabbitMQClient {
 
         log::info!("Published message to queue '{}'", routing);
         Ok(())
+    }
+
+    /// Creates a fluent message builder for publishing.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn example(client: &comms::RabbitMQClient) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// use serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct Order { id: u32, item: String }
+    ///
+    /// // Simple — send to the client's default queue
+    /// client.send(&Order { id: 1, item: "widget".into() }).publish().await?;
+    ///
+    /// // Fluent — target a specific queue with metadata
+    /// client.send(&Order { id: 2, item: "gadget".into() })
+    ///     .to("orders.priority")
+    ///     .priority(9)
+    ///     .expires_in_secs(60)
+    ///     .message_id("ord-002")
+    ///     .publish()
+    ///     .await?;
+    ///
+    /// // Raw bytes
+    /// client.send_bytes(b"ping".to_vec())
+    ///     .to("health")
+    ///     .content_type("text/plain")
+    ///     .transient()
+    ///     .publish()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn send<'a, T: Serialize>(&'a self, message: &T) -> MessageBuilder<'a> {
+        let payload = serde_json::to_vec(message).expect("failed to serialize message");
+        MessageBuilder::new(self, payload)
+    }
+
+    /// Creates a fluent message builder from raw bytes.
+    pub fn send_bytes(&self, payload: Vec<u8>) -> MessageBuilder<'_> {
+        MessageBuilder::new(self, payload)
+    }
+
+    async fn publish_raw(
+        &self,
+        payload: &[u8],
+        routing_key: &str,
+        exchange: &str,
+        properties: BasicProperties,
+        options: BasicPublishOptions,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let connection = self.pool.get().await?;
+        let channel = connection.create_channel().await?;
+
+        channel
+            .basic_publish(exchange, routing_key, options, payload, properties)
+            .await?;
+
+        log::info!("Published message to '{}'", routing_key);
+        Ok(())
+    }
+}
+
+/// A fluent builder for constructing and publishing RabbitMQ messages.
+///
+/// Created via [`RabbitMQClient::send`] or [`RabbitMQClient::send_bytes`].
+/// Call [`.publish().await`](MessageBuilder::publish) to send the message.
+pub struct MessageBuilder<'a> {
+    client: &'a RabbitMQClient,
+    payload: Vec<u8>,
+    routing_key: Option<String>,
+    exchange: String,
+    properties: BasicProperties,
+    options: BasicPublishOptions,
+}
+
+impl<'a> MessageBuilder<'a> {
+    fn new(client: &'a RabbitMQClient, payload: Vec<u8>) -> Self {
+        Self {
+            client,
+            payload,
+            routing_key: None,
+            exchange: String::new(),
+            properties: BasicProperties::default().with_delivery_mode(2),
+            options: BasicPublishOptions::default(),
+        }
+    }
+
+    /// Sets the target queue / routing key. Defaults to the client's queue.
+    pub fn to(mut self, queue: &str) -> Self {
+        self.routing_key = Some(queue.to_string());
+        self
+    }
+
+    /// Sets the exchange to publish to. Defaults to the default exchange ("").
+    pub fn exchange(mut self, exchange: &str) -> Self {
+        self.exchange = exchange.to_string();
+        self
+    }
+
+    /// Sets the message content type (e.g. "application/json").
+    pub fn content_type(mut self, ct: &str) -> Self {
+        self.properties = self.properties.with_content_type(ct.into());
+        self
+    }
+
+    /// Sets the message content encoding (e.g. "gzip").
+    pub fn content_encoding(mut self, encoding: &str) -> Self {
+        self.properties = self.properties.with_content_encoding(encoding.into());
+        self
+    }
+
+    /// Marks the message as persistent (delivery_mode = 2). This is the default.
+    pub fn persistent(mut self) -> Self {
+        self.properties = self.properties.with_delivery_mode(2);
+        self
+    }
+
+    /// Marks the message as transient (delivery_mode = 1). It will not survive broker restarts.
+    pub fn transient(mut self) -> Self {
+        self.properties = self.properties.with_delivery_mode(1);
+        self
+    }
+
+    /// Sets the message priority (0–9, where 9 is highest).
+    pub fn priority(mut self, priority: u8) -> Self {
+        self.properties = self.properties.with_priority(priority);
+        self
+    }
+
+    /// Sets the correlation ID, typically used for RPC-style request/response patterns.
+    pub fn correlation_id(mut self, id: &str) -> Self {
+        self.properties = self.properties.with_correlation_id(id.into());
+        self
+    }
+
+    /// Sets the reply-to queue for RPC-style patterns.
+    pub fn reply_to(mut self, queue: &str) -> Self {
+        self.properties = self.properties.with_reply_to(queue.into());
+        self
+    }
+
+    /// Sets a TTL (time-to-live) on the message as a raw string (milliseconds).
+    pub fn expiration(mut self, ms: &str) -> Self {
+        self.properties = self.properties.with_expiration(ms.into());
+        self
+    }
+
+    /// Convenience: sets the message TTL in seconds.
+    pub fn expires_in_secs(self, secs: u64) -> Self {
+        self.expiration(&(secs * 1000).to_string())
+    }
+
+    /// Sets a unique message ID.
+    pub fn message_id(mut self, id: &str) -> Self {
+        self.properties = self.properties.with_message_id(id.into());
+        self
+    }
+
+    /// Sets the message timestamp (unix epoch seconds).
+    pub fn timestamp(mut self, ts: u64) -> Self {
+        self.properties = self.properties.with_timestamp(ts);
+        self
+    }
+
+    /// Sets the message type identifier.
+    pub fn message_type(mut self, t: &str) -> Self {
+        self.properties = self.properties.with_type(t.into());
+        self
+    }
+
+    /// Sets the application ID.
+    pub fn app_id(mut self, id: &str) -> Self {
+        self.properties = self.properties.with_app_id(id.into());
+        self
+    }
+
+    /// Sets custom headers on the message.
+    pub fn headers(mut self, headers: FieldTable) -> Self {
+        self.properties = self.properties.with_headers(headers);
+        self
+    }
+
+    /// Enables the `mandatory` flag — the broker will return the message if it
+    /// can't be routed to any queue.
+    pub fn mandatory(mut self) -> Self {
+        self.options.mandatory = true;
+        self
+    }
+
+    /// Enables the `immediate` flag.
+    pub fn immediate(mut self) -> Self {
+        self.options.immediate = true;
+        self
+    }
+
+    /// Publishes the message to the broker.
+    pub async fn publish(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let routing = self.routing_key.as_deref()
+            .unwrap_or(&self.client.queue_name);
+
+        self.client
+            .publish_raw(&self.payload, routing, &self.exchange, self.properties, self.options)
+            .await
     }
 }
