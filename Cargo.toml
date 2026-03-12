@@ -9,7 +9,7 @@ repository = "https://github.com/damac-italia/comms"
 
 [dependencies]
 redis = "0.32.7"
-deadpool-lapin = { version = "0.13.1", features = ["native-tls"] }
+deadpool-lapin = { version = "0.13.1", features = ["native-tls", "default-runtime"] }
 deadpool = { version = "0.13.0", features = ["managed"] }
 native-tls = "0.2.18"
 async-trait = "0.1.89"
