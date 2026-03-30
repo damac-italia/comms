@@ -12,14 +12,18 @@ struct TestMessage {
 
 /// Runs a comprehensive suite of integration tests against the provided configuration.
 /// This can be called by implementing software to verify their environment on startup.
+/// Redis tests are skipped when `REDIS_URL` is not configured.
 pub async fn run_self_tests(config: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    test_redis(config).await?;
+    match (&config.redis_url, config.redis_database) {
+        (Some(url), Some(db)) => test_redis(url, db).await?,
+        _ => log::warn!("REDIS_URL not set — skipping Redis self-tests"),
+    }
     test_rabbitmq(config).await?;
     Ok(())
 }
 
-async fn test_redis(config: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut redis = RedisClient::new(&config.redis_url, config.redis_database)?;
+async fn test_redis(url: &str, database: u8) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut redis = RedisClient::new(url, database)?;
     let key = "comms_test_key";
     let value = "comms_test_value";
 

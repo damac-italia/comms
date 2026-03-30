@@ -25,9 +25,9 @@ The library uses `env_logger` with a customized format. Calling `init_logger()` 
 ### 2. Configuration Management
 The `Config` struct is the central hub for environment-based settings. It supports loading from a `.env` file or system environment variables:
 - `RABBITMQ_URL`: Connection string for RabbitMQ.
-- `REDIS_URL`: Connection string for Redis.
+- `REDIS_URL` *(optional)*: Connection string for Redis. When unset, Redis features and self-tests are skipped with a warning.
 - `QUEUE_NAME`: Default queue for the RabbitMQ client.
-- `REDIS_DATABASE`: Target database index for Redis.
+- `REDIS_DATABASE`: Target database index for Redis (only used when `REDIS_URL` is set).
 
 ### 3. RabbitMQ: Resilience & Decoupling
 The `RabbitMQClient` is built on top of `deadpool-lapin`, providing:

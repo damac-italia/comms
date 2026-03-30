@@ -10,11 +10,12 @@ pub struct Config {
     /// The AMQP URL for RabbitMQ (e.g., "amqp://user:pass@host:5672" or "amqps://user:pass@host:5671").
     pub rabbitmq_url: String,
     /// The Redis connection URL (e.g., "redis://host:6379").
-    pub redis_url: String,
+    /// `None` when `REDIS_URL` is not set — Redis features will be skipped.
+    pub redis_url: Option<String>,
     /// The name of the RabbitMQ queue to use by default.
     pub queue_name: String,
-    /// The Redis database index (0-15).
-    pub redis_database: u8,
+    /// The Redis database index (0-15). `None` when Redis is not configured.
+    pub redis_database: Option<u8>,
     /// Optional TLS configuration for RabbitMQ connections.
     pub rabbitmq_tls: Option<RabbitTlsConfig>,
 }
@@ -24,9 +25,9 @@ impl Config {
     ///
     /// It looks for:
     /// - `RABBITMQ_URL` (default: amqp://guest:guest@localhost:5672)
-    /// - `REDIS_URL` (default: redis://localhost:6379)
+    /// - `REDIS_URL` (optional — if unset, Redis features are disabled)
     /// - `QUEUE_NAME` (default: default_queue)
-    /// - `REDIS_DATABASE` (default: 0)
+    /// - `REDIS_DATABASE` (default: 0, only used when `REDIS_URL` is set)
     /// - `RABBITMQ_TLS_CA_CERT` (optional: path to PEM CA certificate)
     /// - `RABBITMQ_TLS_SKIP_VERIFY` (optional: set to "true" to skip TLS verification)
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
@@ -44,17 +45,25 @@ impl Config {
             None
         };
 
+        let redis_url = env::var("REDIS_URL").ok();
+        let redis_database = if redis_url.is_some() {
+            Some(
+                env::var("REDIS_DATABASE")
+                    .unwrap_or_else(|_| "0".to_string())
+                    .parse()
+                    .unwrap_or(0),
+            )
+        } else {
+            None
+        };
+
         Ok(Config {
             rabbitmq_url: env::var("RABBITMQ_URL")
                 .unwrap_or_else(|_| "amqp://guest:guest@localhost:5672".to_string()),
-            redis_url: env::var("REDIS_URL")
-                .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
+            redis_url,
             queue_name: env::var("QUEUE_NAME")
                 .unwrap_or_else(|_| "default_queue".to_string()),
-            redis_database: env::var("REDIS_DATABASE")
-                .unwrap_or_else(|_| "0".to_string())
-                .parse()
-                .unwrap_or(0),
+            redis_database,
             rabbitmq_tls,
         })
     }
@@ -62,9 +71,9 @@ impl Config {
     /// Creates a new configuration instance manually.
     pub fn new(
         rabbitmq_url: String,
-        redis_url: String,
+        redis_url: Option<String>,
         queue_name: String,
-        redis_database: u8,
+        redis_database: Option<u8>,
     ) -> Self {
         Config {
             rabbitmq_url,
@@ -78,9 +87,9 @@ impl Config {
     /// Creates a new configuration instance with TLS support.
     pub fn new_with_tls(
         rabbitmq_url: String,
-        redis_url: String,
+        redis_url: Option<String>,
         queue_name: String,
-        redis_database: u8,
+        redis_database: Option<u8>,
         tls_config: RabbitTlsConfig,
     ) -> Self {
         Config {
@@ -101,15 +110,27 @@ mod tests {
     fn new_creates_config_without_tls() {
         let cfg = Config::new(
             "amqp://localhost".into(),
-            "redis://localhost".into(),
+            Some("redis://localhost".into()),
             "my_queue".into(),
-            3,
+            Some(3),
         );
         assert_eq!(cfg.rabbitmq_url, "amqp://localhost");
-        assert_eq!(cfg.redis_url, "redis://localhost");
+        assert_eq!(cfg.redis_url.as_deref(), Some("redis://localhost"));
         assert_eq!(cfg.queue_name, "my_queue");
-        assert_eq!(cfg.redis_database, 3);
+        assert_eq!(cfg.redis_database, Some(3));
         assert!(cfg.rabbitmq_tls.is_none());
+    }
+
+    #[test]
+    fn new_creates_config_without_redis() {
+        let cfg = Config::new(
+            "amqp://localhost".into(),
+            None,
+            "my_queue".into(),
+            None,
+        );
+        assert!(cfg.redis_url.is_none());
+        assert!(cfg.redis_database.is_none());
     }
 
     #[test]
@@ -117,9 +138,9 @@ mod tests {
         let tls = RabbitTlsConfig::insecure();
         let cfg = Config::new_with_tls(
             "amqps://host".into(),
-            "redis://host".into(),
+            Some("redis://host".into()),
             "q".into(),
-            0,
+            Some(0),
             tls,
         );
         let tls = cfg.rabbitmq_tls.unwrap();
@@ -140,13 +161,21 @@ mod tests {
             std::env::remove_var("RABBITMQ_TLS_SKIP_VERIFY");
         }
 
-        // Without TLS vars → defaults, no TLS
+        // Without REDIS_URL → redis fields are None
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.rabbitmq_url, "amqp://guest:guest@localhost:5672");
-        assert_eq!(cfg.redis_url, "redis://localhost:6379");
+        assert!(cfg.redis_url.is_none());
         assert_eq!(cfg.queue_name, "default_queue");
-        assert_eq!(cfg.redis_database, 0);
+        assert!(cfg.redis_database.is_none());
         assert!(cfg.rabbitmq_tls.is_none());
+
+        // With REDIS_URL set → redis fields populated
+        unsafe {
+            std::env::set_var("REDIS_URL", "redis://myhost:6379");
+        }
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.redis_url.as_deref(), Some("redis://myhost:6379"));
+        assert_eq!(cfg.redis_database, Some(0));
 
         // With TLS skip-verify → TLS config present
         unsafe {
@@ -157,12 +186,15 @@ mod tests {
         assert!(tls.skip_cert_verification);
         assert!(tls.ca_cert_path.is_none());
 
-        unsafe { std::env::remove_var("RABBITMQ_TLS_SKIP_VERIFY"); }
+        unsafe {
+            std::env::remove_var("REDIS_URL");
+            std::env::remove_var("RABBITMQ_TLS_SKIP_VERIFY");
+        }
     }
 
     #[test]
     fn config_is_cloneable() {
-        let cfg = Config::new("a".into(), "b".into(), "c".into(), 1);
+        let cfg = Config::new("a".into(), Some("b".into()), "c".into(), Some(1));
         let cloned = cfg.clone();
         assert_eq!(cloned.rabbitmq_url, cfg.rabbitmq_url);
         assert_eq!(cloned.redis_database, cfg.redis_database);
